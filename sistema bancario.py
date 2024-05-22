@@ -2,6 +2,21 @@ import datetime
 import textwrap
 import pytz
 from abc import ABC, abstractclassmethod, abstractproperty
+import logging
+import os
+import pickle
+
+# Configuração do Logger
+log_directory = "logs"
+if not os.path.exists(log_directory):
+    os.makedirs(log_directory)
+
+log_filename = os.path.join(log_directory, "transacoes.log")
+logging.basicConfig(filename=log_filename, level=logging.INFO, format="%(asctime)s - %(message)s")
+
+# Caminhos dos arquivos de dados
+clientes_filename = os.path.join(log_directory, "clientes.pkl")
+contas_filename = os.path.join(log_directory, "contas.pkl")
 
 class ContasIterador:
     def __init__(self, contas):
@@ -78,6 +93,7 @@ class ContaBancaria(ABC):
             agora = datetime.datetime.now(self.fuso_horario)
             self.historico.adicionar_transacao(Deposito(valor))
             print("Depósito realizado com sucesso.")
+            logging.info(f"Depósito: R$ {valor:.2f} - Saldo: R$ {self._saldo:.2f}")
         else:
             print("Operação falhou! O valor informado é inválido.")
 
@@ -97,6 +113,7 @@ class ContaBancaria(ABC):
             agora = datetime.datetime.now(self.fuso_horario)
             self.historico.adicionar_transacao(Saque(valor))
             print("Saque realizado com sucesso.")
+            logging.info(f"Saque: R$ {valor:.2f} - Saldo: R$ {self._saldo:.2f}")
         else:
             print("Operação falhou! O valor informado é inválido.")
 
@@ -215,7 +232,8 @@ class Deposito(Transacao):
 def log_transacao(func):
     def envelope(*args, **kwargs):
         resultado = func(*args, **kwargs)
-        print(f"{datetime.datetime.now()}: {func.__name__.upper()}")
+        transacao_info = f"{datetime.datetime.now()}: {func.__name__.upper()}"
+        logging.info(transacao_info)
         return resultado
 
     return envelope
@@ -223,7 +241,7 @@ def log_transacao(func):
 
 def exibir_menu():
     menu = """\n
-    ================ BANCO PIXAQUI ================
+    ================ BANCO PIX ================
     [d]\tDepositar
     [s]\tSacar
     [e]\tExtrato
@@ -260,13 +278,11 @@ def depositar(clientes):
         return
 
     valor = float(input("Informe o valor do depósito: "))
-    transacao = Deposito(valor)
-
     conta = recuperar_conta_cliente(cliente)
     if not conta:
         return
 
-    cliente.realizar_transacao(conta, transacao)
+    cliente.realizar_transacao(conta, Deposito(valor))
 
 
 @log_transacao
@@ -279,13 +295,11 @@ def sacar(clientes):
         return
 
     valor = float(input("Informe o valor do saque: "))
-    transacao = Saque(valor)
-
     conta = recuperar_conta_cliente(cliente)
     if not conta:
         return
 
-    cliente.realizar_transacao(conta, transacao)
+    cliente.realizar_transacao(conta, Saque(valor))
 
 
 @log_transacao
@@ -301,19 +315,7 @@ def exibir_extrato(clientes):
     if not conta:
         return
 
-    print("\n================ EXTRATO ================")
-    extrato = ""
-    tem_transacao = False
-    for transacao in conta.historico.gerar_relatorio():
-        tem_transacao = True
-        extrato += f'\n{transacao["tipo"]}:\n\tR$ {transacao["valor"]:.2f}'
-
-    if not tem_transacao:
-        extrato = "Não foram realizadas movimentações"
-
-    print(extrato)
-    print(f"\nSaldo:\n\tR$ {conta.saldo:.2f}")
-    print("==========================================")
+    conta.extrato()
 
 
 @log_transacao
@@ -365,9 +367,25 @@ def listar_usuarios(clientes):
     print("==========================================")
 
 
+def salvar_dados(clientes, contas):
+    with open(clientes_filename, 'wb') as clientes_file:
+        pickle.dump(clientes, clientes_file)
+    with open(contas_filename, 'wb') as contas_file:
+        pickle.dump(contas, contas_file)
+
+
+def carregar_dados():
+    if os.path.exists(clientes_filename) and os.path.exists(contas_filename):
+        with open(clientes_filename, 'rb') as clientes_file:
+            clientes = pickle.load(clientes_file)
+        with open(contas_filename, 'rb') as contas_file:
+            contas = pickle.load(contas_file)
+        return clientes, contas
+    return [], []
+
+
 def main():
-    clientes = []
-    contas = []
+    clientes, contas = carregar_dados()
 
     while True:
         opcao = exibir_menu()
@@ -395,6 +413,7 @@ def main():
             listar_usuarios(clientes)
 
         elif opcao == "q":
+            salvar_dados(clientes, contas)
             break
 
         else:
