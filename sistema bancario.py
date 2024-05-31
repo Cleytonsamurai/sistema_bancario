@@ -4,7 +4,7 @@ import pytz
 from abc import ABC, abstractclassmethod, abstractproperty
 import logging
 import os
-import pickle
+import sqlite3
 
 # Configuração do Logger
 log_directory = "logs"
@@ -14,9 +14,47 @@ if not os.path.exists(log_directory):
 log_filename = os.path.join(log_directory, "transacoes.log")
 logging.basicConfig(filename=log_filename, level=logging.INFO, format="%(asctime)s - %(message)s")
 
-# Caminhos dos arquivos de dados
-clientes_filename = os.path.join(log_directory, "clientes.pkl")
-contas_filename = os.path.join(log_directory, "contas.pkl")
+# Configuração do Banco de Dados SQLite
+db_filename = os.path.join(log_directory, "banco_pix.db")
+
+conn = sqlite3.connect(db_filename)
+cursor = conn.cursor()
+
+# Criação das tabelas
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS clientes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT NOT NULL,
+    data_nascimento TEXT NOT NULL,
+    cpf TEXT NOT NULL UNIQUE,
+    endereco TEXT NOT NULL
+)
+''')
+
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS contas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    numero TEXT NOT NULL,
+    agencia TEXT NOT NULL,
+    saldo REAL NOT NULL,
+    limite REAL NOT NULL,
+    limite_saques INTEGER NOT NULL,
+    cliente_id INTEGER NOT NULL,
+    FOREIGN KEY (cliente_id) REFERENCES clientes (id)
+)
+''')
+
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS transacoes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tipo TEXT NOT NULL,
+    valor REAL NOT NULL,
+    data TEXT NOT NULL,
+    conta_id INTEGER NOT NULL,
+    FOREIGN KEY (conta_id) REFERENCES contas (id)
+)
+''')
+conn.commit()
 
 class ContasIterador:
     def __init__(self, contas):
@@ -30,10 +68,10 @@ class ContasIterador:
         try:
             conta = self.contas[self._index]
             return f"""\
-            Agência:\t{conta.agencia}
-            Número:\t\t{conta.numero}
-            Titular:\t{conta.cliente.nome}
-            Saldo:\t\tR$ {conta.saldo:.2f}
+            Agência:\t{conta['agencia']}
+            Número:\t\t{conta['numero']}
+            Titular:\t{conta['cliente']['nome']}
+            Saldo:\t\tR$ {conta['saldo']:.2f}
         """
         except IndexError:
             raise StopIteration
@@ -42,13 +80,13 @@ class ContasIterador:
 
 
 class Cliente:
-    def __init__(self, nome, data_nascimento, cpf, endereco):
+    def __init__(self, nome, data_nascimento, cpf, endereco, id=None):
+        self.id = id
         self.nome = nome
         self.data_nascimento = data_nascimento
         self.cpf = cpf
         self.endereco = endereco
         self.contas = []
-        self.indice_conta = 0
 
     def realizar_transacao(self, conta, transacao):
         if len(conta.historico.transacoes_do_dia()) >= 2:
@@ -86,7 +124,7 @@ class ContaBancaria(ABC):
     def depositar(self, valor):
         if not self.pode_fazer_transacao():
             print("Você excedeu o número de transações permitidas para hoje.")
-            return
+            return False
 
         if valor > 0:
             self._saldo += valor
@@ -94,28 +132,35 @@ class ContaBancaria(ABC):
             self.historico.adicionar_transacao(Deposito(valor))
             print("Depósito realizado com sucesso.")
             logging.info(f"Depósito: R$ {valor:.2f} - Saldo: R$ {self._saldo:.2f}")
+            return True
         else:
             print("Operação falhou! O valor informado é inválido.")
+            return False
 
     def sacar(self, valor):
         if not self.pode_fazer_transacao():
             print("Você excedeu o número de transações permitidas para hoje.")
-            return
+            return False
 
         if valor > self._saldo:
             print("Operação falhou! Você não tem saldo suficiente.")
+            return False
         elif valor > 500:
             print("Operação falhou! O valor do saque excede o limite.")
+            return False
         elif len([t for t in self.historico.transacoes if t["tipo"] == "Saque"]) >= 3:
             print("Operação falhou! Número máximo de saques excedido.")
+            return False
         elif valor > 0:
             self._saldo -= valor
             agora = datetime.datetime.now(self.fuso_horario)
             self.historico.adicionar_transacao(Saque(valor))
             print("Saque realizado com sucesso.")
             logging.info(f"Saque: R$ {valor:.2f} - Saldo: R$ {self._saldo:.2f}")
+            return True
         else:
             print("Operação falhou! O valor informado é inválido.")
+            return False
 
     def extrato(self):
         print("\n================ EXTRATO ================")
@@ -212,6 +257,11 @@ class Saque(Transacao):
 
         if sucesso_transacao:
             conta.historico.adicionar_transacao(self)
+            cursor.execute(
+                "INSERT INTO transacoes (tipo, valor, data, conta_id) VALUES (?, ?, ?, ?)",
+                ("Saque", self.valor, datetime.datetime.now().strftime("%d-%m-%Y %H:%M:%S"), conta.id)
+            )
+            conn.commit()
 
 
 class Deposito(Transacao):
@@ -227,6 +277,11 @@ class Deposito(Transacao):
 
         if sucesso_transacao:
             conta.historico.adicionar_transacao(self)
+            cursor.execute(
+                "INSERT INTO transacoes (tipo, valor, data, conta_id) VALUES (?, ?, ?, ?)",
+                ("Deposito", self.valor, datetime.datetime.now().strftime("%d-%m-%Y %H:%M:%S"), conta.id)
+            )
+            conn.commit()
 
 
 def log_transacao(func):
@@ -249,29 +304,35 @@ def exibir_menu():
     [lc]\tListar contas
     [lu]\tListar usuários
     [nu]\tNovo usuário
+    [ec]\tExcluir cliente (admin)
     [q]\tSair
     => """
     return input(textwrap.dedent(menu))
 
 
-def filtrar_cliente(cpf, clientes):
-    clientes_filtrados = [cliente for cliente in clientes if cliente.cpf == cpf]
-    return clientes_filtrados[0] if clientes_filtrados else None
+def filtrar_cliente(cpf):
+    cursor.execute("SELECT id, nome, data_nascimento, cpf, endereco FROM clientes WHERE cpf = ?", (cpf,))
+    row = cursor.fetchone()
+    if row:
+        return Cliente(id=row[0], nome=row[1], data_nascimento=row[2], cpf=row[3], endereco=row[4])
+    return None
 
 
 def recuperar_conta_cliente(cliente):
-    if not cliente.contas:
-        print("\n@@@ Cliente não possui conta! @@@")
-        return None
-
-    # FIXME: não permite cliente escolher a conta
-    return cliente.contas[0]
+    cursor.execute("SELECT id, numero, agencia, saldo, limite, limite_saques FROM contas WHERE cliente_id = ?", (cliente.id,))
+    row = cursor.fetchone()
+    if row:
+        conta = ContaCorrente(numero=row[1], cliente=cliente, saldo_inicial=row[3], limite=row[4], limite_saques=row[5])
+        conta.id = row[0]
+        return conta
+    print("\n@@@ Cliente não possui conta! @@@")
+    return None
 
 
 @log_transacao
 def depositar(clientes):
     cpf = input("Informe o CPF do cliente: ")
-    cliente = filtrar_cliente(cpf, clientes)
+    cliente = filtrar_cliente(cpf)
 
     if not cliente:
         print("\n@@@ Cliente não encontrado! @@@")
@@ -288,7 +349,7 @@ def depositar(clientes):
 @log_transacao
 def sacar(clientes):
     cpf = input("Informe o CPF do cliente: ")
-    cliente = filtrar_cliente(cpf, clientes)
+    cliente = filtrar_cliente(cpf)
 
     if not cliente:
         print("\n@@@ Cliente não encontrado! @@@")
@@ -305,7 +366,7 @@ def sacar(clientes):
 @log_transacao
 def exibir_extrato(clientes):
     cpf = input("Informe o CPF do cliente: ")
-    cliente = filtrar_cliente(cpf, clientes)
+    cliente = filtrar_cliente(cpf)
 
     if not cliente:
         print("\n@@@ Cliente não encontrado! @@@")
@@ -321,7 +382,7 @@ def exibir_extrato(clientes):
 @log_transacao
 def criar_cliente(clientes):
     cpf = input("Informe o CPF (somente número): ")
-    cliente = filtrar_cliente(cpf, clientes)
+    cliente = filtrar_cliente(cpf)
 
     if cliente:
         print("\n@@@ Já existe cliente com esse CPF! @@@")
@@ -331,61 +392,79 @@ def criar_cliente(clientes):
     data_nascimento = input("Informe a data de nascimento (dd-mm-aaaa): ")
     endereco = input("Informe o endereço (logradouro, nro - bairro - cidade/sigla estado): ")
 
-    cliente = Cliente(nome=nome, data_nascimento=data_nascimento, cpf=cpf, endereco=endereco)
-
-    clientes.append(cliente)
-
+    cursor.execute(
+        "INSERT INTO clientes (nome, data_nascimento, cpf, endereco) VALUES (?, ?, ?, ?)",
+        (nome, data_nascimento, cpf, endereco)
+    )
+    conn.commit()
     print("\n=== Cliente criado com sucesso! ===")
 
 
 @log_transacao
 def criar_conta(numero_conta, clientes, contas):
     cpf = input("Informe o CPF do cliente: ")
-    cliente = filtrar_cliente(cpf, clientes)
+    cliente = filtrar_cliente(cpf)
 
     if not cliente:
         print("\n@@@ Cliente não encontrado, fluxo de criação de conta encerrado! @@@")
         return
 
     conta = ContaCorrente(numero=numero_conta, cliente=cliente, saldo_inicial=0, limite=500, limite_saques=50)
-    contas.append(conta)
-    cliente.adicionar_conta(conta)
-
+    cursor.execute(
+        "INSERT INTO contas (numero, agencia, saldo, limite, limite_saques, cliente_id) VALUES (?, ?, ?, ?, ?, ?)",
+        (conta.numero, conta.agencia, conta.saldo, conta._limite, conta._limite_saques, cliente.id)
+    )
+    conn.commit()
     print("\n=== Conta criada com sucesso! ===")
 
 
 def listar_contas(contas):
-    for conta in ContasIterador(contas):
+    cursor.execute("SELECT contas.numero, contas.agencia, contas.saldo, clientes.nome FROM contas JOIN clientes ON contas.cliente_id = clientes.id")
+    contas = cursor.fetchall()
+    for conta in contas:
         print("=" * 100)
-        print(textwrap.dedent(str(conta)))
+        print(f"Agência:\t{conta[1]}\nNúmero:\t\t{conta[0]}\nTitular:\t{conta[3]}\nSaldo:\t\tR$ {conta[2]:.2f}\n")
 
 
 def listar_usuarios(clientes):
+    cursor.execute("SELECT nome, cpf FROM clientes")
+    clientes = cursor.fetchall()
     print("\n================ USUÁRIOS ================")
     for cliente in clientes:
-        print(f"Nome: {cliente.nome}\tCPF: {cliente.cpf}")
+        print(f"Nome: {cliente[0]}\tCPF: {cliente[1]}")
     print("==========================================")
 
 
-def salvar_dados(clientes, contas):
-    with open(clientes_filename, 'wb') as clientes_file:
-        pickle.dump(clientes, clientes_file)
-    with open(contas_filename, 'wb') as contas_file:
-        pickle.dump(contas, contas_file)
+@log_transacao
+def excluir_cliente():
+    cpf = input("Informe o CPF do cliente a ser excluído: ")
+    cliente = filtrar_cliente(cpf)
+
+    if not cliente:
+        print("\n@@@ Cliente não encontrado! @@@")
+        return
+
+    cursor.execute("DELETE FROM contas WHERE cliente_id = ?", (cliente.id,))
+    cursor.execute("DELETE FROM clientes WHERE id = ?", (cliente.id,))
+    conn.commit()
+    print("\n=== Cliente excluído com sucesso! ===")
 
 
-def carregar_dados():
-    if os.path.exists(clientes_filename) and os.path.exists(contas_filename):
-        with open(clientes_filename, 'rb') as clientes_file:
-            clientes = pickle.load(clientes_file)
-        with open(contas_filename, 'rb') as contas_file:
-            contas = pickle.load(contas_file)
-        return clientes, contas
-    return [], []
+def login():
+    print("=============== LOGIN ===============")
+    username = input("Usuário: ")
+    password = input("Senha: ")
+
+    if username == "admin" and password == "admin":
+        return True
+    else:
+        print("Usuário ou senha incorretos!")
+        return False
 
 
 def main():
-    clientes, contas = carregar_dados()
+    if not login():
+        return
 
     while True:
         opcao = exibir_menu()
@@ -403,7 +482,8 @@ def main():
             criar_cliente(clientes)
 
         elif opcao == "nc":
-            numero_conta = len(contas) + 1
+            cursor.execute("SELECT COUNT(*) FROM contas")
+            numero_conta = cursor.fetchone()[0] + 1
             criar_conta(numero_conta, clientes, contas)
 
         elif opcao == "lc":
@@ -412,8 +492,11 @@ def main():
         elif opcao == "lu":
             listar_usuarios(clientes)
 
+        elif opcao == "ec":
+            excluir_cliente()
+
         elif opcao == "q":
-            salvar_dados(clientes, contas)
+            conn.close()
             break
 
         else:
